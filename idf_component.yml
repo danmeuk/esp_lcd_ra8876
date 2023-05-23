@@ -1,0 +1,5 @@
+dependencies:
+  idf: '>=4.4.4'
+description: esp_lcd driver for RA8876/LT768x based displays
+url: https://github.com/danmeuk/esp_lcd_ra8876
+version: 0.1
