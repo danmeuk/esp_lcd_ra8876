@@ -75,6 +75,7 @@ typedef struct {
 	uint16_t						lcd_height;					/*!< LCD height in pixels */
 	uint8_t							chip_config_register;		/*!< CCR value */
 	uint8_t							display_config_register;	/*!< PDCR value */
+	uint8_t							macr;						/*!< Memory Access Control Register value */
 	bool							swap_axes;					/*!< whether to swap X/Y axis */
 	uint16_t						backlight_level;			/*! backlight level if using PWM (16-bit integer) */
 } ra8876_panel_t;
@@ -92,7 +93,7 @@ esp_err_t esp_lcd_new_panel_ra8876(const esp_lcd_panel_io_handle_t io, const esp
 	ESP_GOTO_ON_FALSE(ra8876, ESP_ERR_NO_MEM, err, TAG, "no mem for ra8876 panel");
 
 	/* RST GPIO config (if applicable) */
-	if (panel_dev_config->reset_gpio_num >= GPIO_NUM_0)
+	if (panel_dev_config->reset_gpio_num != GPIO_NUM_NC)
 	{
 		gpio_config_t io_conf =
 		{
@@ -103,7 +104,7 @@ esp_err_t esp_lcd_new_panel_ra8876(const esp_lcd_panel_io_handle_t io, const esp
 	}
 
 	/* WAIT GPIO config (if applicable) */
-	if (vendor_cfg->wait_gpio_num >= GPIO_NUM_0)
+	if (vendor_cfg->wait_gpio_num != GPIO_NUM_NC)
 	{
 		gpio_config_t io_conf =
 		{
@@ -117,6 +118,8 @@ esp_err_t esp_lcd_new_panel_ra8876(const esp_lcd_panel_io_handle_t io, const esp
 	/* Setup default CCR and PDCR values (both 0x00 by default) */
 	ra8876->chip_config_register = 0x00;
 	ra8876->display_config_register = 0x00;
+	/* Setup default memory address control register to 16bpp, no rotation */
+	ra8876->macr = 0x40;
 	
 	// Note: Color space used for compatibility with IDF v4.4
 	switch (panel_dev_config->color_space)
@@ -153,6 +156,7 @@ esp_err_t esp_lcd_new_panel_ra8876(const esp_lcd_panel_io_handle_t io, const esp
 	ra8876->io = io;
 	ra8876->lcd_width = vendor_cfg->lcd_width;
 	ra8876->lcd_height = vendor_cfg->lcd_height;
+	ra8876->reset_gpio_num = panel_dev_config->reset_gpio_num;
 	ra8876->wait_gpio_num = vendor_cfg->wait_gpio_num;
 	ra8876->bits_per_pixel = panel_dev_config->bits_per_pixel;
 	ra8876->reset_gpio_num = panel_dev_config->reset_gpio_num;
@@ -179,9 +183,9 @@ err:
 	if (ra8876)
 	{
 		/* tidy up RST and/or WAIT gpio pins */
-		if (ra8876->reset_gpio_num >= GPIO_NUM_0)
+		if (ra8876->reset_gpio_num != GPIO_NUM_NC)
 			gpio_reset_pin(ra8876->reset_gpio_num);
-		if (ra8876->wait_gpio_num >= GPIO_NUM_0)
+		if (ra8876->wait_gpio_num != GPIO_NUM_NC)
 			gpio_reset_pin(ra8876->wait_gpio_num);
 		free(ra8876);
 	}
@@ -192,9 +196,9 @@ static esp_err_t panel_ra8876_del(esp_lcd_panel_t *panel)
 {
 	ra8876_panel_t					*ra8876 = __containerof(panel, ra8876_panel_t, base);
 
-	if (ra8876->reset_gpio_num >= GPIO_NUM_0)
+	if (ra8876->reset_gpio_num != GPIO_NUM_NC)
 		gpio_reset_pin(ra8876->reset_gpio_num);
-	if (ra8876->wait_gpio_num >= GPIO_NUM_0)
+	if (ra8876->wait_gpio_num != GPIO_NUM_NC)
 		gpio_reset_pin(ra8876->wait_gpio_num);
 
 	ESP_LOGD(TAG, "del ra8876 panel @%p", ra8876);
@@ -207,7 +211,7 @@ static esp_err_t panel_ra8876_reset(esp_lcd_panel_t *panel)
 	ra8876_panel_t					*ra8876 = __containerof(panel, ra8876_panel_t, base);
 	esp_lcd_panel_io_handle_t		io = ra8876->io;
 
-	if (ra8876->reset_gpio_num >= 0)
+	if (ra8876->reset_gpio_num != GPIO_NUM_NC)
 	{
 		/* perform hardware reset */
 		gpio_set_level(ra8876->reset_gpio_num, ra8876->reset_level);
@@ -245,264 +249,145 @@ static esp_err_t panel_ra8876_tx_param(esp_lcd_panel_t *panel, int lcd_cmd, uint
 	ra8876_panel_t					*ra8876 = __containerof(panel, ra8876_panel_t, base);
 	esp_lcd_panel_io_handle_t		io = ra8876->io;
 
-	panel_ra8876_wait(panel);
+ 	panel_ra8876_wait(panel);
 	return esp_lcd_panel_io_tx_param(io, lcd_cmd, (uint8_t[]) {	param }, 1);
 }
 
 static esp_err_t panel_ra8876_init(esp_lcd_panel_t *panel)
 {
 	ra8876_panel_t					*ra8876 = __containerof(panel, ra8876_panel_t, base);
-	uint8_t							val;
 
-	/* perform hardware reset */
 	vTaskDelay(pdMS_TO_TICKS(100));
 	panel_ra8876_reset(panel);
-	vTaskDelay(pdMS_TO_TICKS(500));
-	/* perform software reset */
-	panel_ra8876_tx_param(panel, RA8876_REG_SRR, 0x01);
+	vTaskDelay(pdMS_TO_TICKS(100));
+	/* wait for reset to complete */
+	panel_ra8876_wait(panel);
+
+	/* perform soft reset */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_SRR, (uint8_t[]) { 0x01 }, 1);
 	panel_ra8876_wait(panel);
 
 	/* set pixel clock */
-#if (RA8876_SCAN_FREQ >= 63)
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC1, RA8876_PLL_DIV_4);
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC2, (RA8876_SCAN_FREQ * 4 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_SCAN_FREQ >= 32) && (RA8876_SCAN_FREQ <= 62)
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC1, RA8876_PLL_DIV_8);
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC2, (RA8876_SCAN_FREQ * 8 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_SCAN_FREQ >= 16) && (RA8876_SCAN_FREQ <= 31)
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC1, RA8876_PLL_DIV_16);
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC2, (RA8876_SCAN_FREQ * 16 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_SCAN_FREQ >= 8) && (RA8876_SCAN_FREQ <= 15)
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC1, RA8876_PLL_DIV_32);
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC2, (RA8876_SCAN_FREQ * 32 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_SCAN_FREQ >= 0) && (RA8876_SCAN_FREQ <= 7)
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC1, RA8876_PLL_DIV_64);
-	panel_ra8876_tx_param(panel, RA8876_REG_PPLLC2, (RA8876_SCAN_FREQ * 64 / RA8876_OSC_FREQ) - 1);
-#endif
-
-	/* set sdram clock */
-#if (RA8876_DRAM_FREQ >= 125)
-	panel_ra8876_tx_param(panel, RA8876_REG_MPLLC1, RA8876_PLL_DIV_2);
-	panel_ra8876_tx_param(panel, RA8876_REG_MPLLC2, (RA8876_DRAM_FREQ * 2 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_DRAM_FREQ >= 63) && (RA8876_DRAM_FREQ <= 124)
-	panel_ra8876_tx_param(panel, RA8876_REG_MPLLC1, RA8876_PLL_DIV_4);
-	panel_ra8876_tx_param(panel, RA8876_REG_MPLLC2, (RA8876_DRAM_FREQ * 4 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_DRAM_FREQ >= 31) && (RA8876_DRAM_FREQ <= 62)
-	panel_ra8876_tx_param(panel, RA8876_REG_MPLLC1, RA8876_PLL_DIV_8);
-	panel_ra8876_tx_param(panel, RA8876_REG_MPLLC2, (RA8876_DRAM_FREQ * 8 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_DRAM_FREQ <= 30)
-	panel_ra8876_tx_param(panel, RA8876_REG_MPLLC1, RA8876_PLL_DIV_8);
-	panel_ra8876_tx_param(panel, RA8876_REG_MPLLC2, (30 * 8 / RA8876_OSC_FREQ) - 1);
-#endif
-
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_PPLLC1, (uint8_t[]) { 0x06 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_PPLLC2, (uint8_t[]) { (RA8876_SCAN_FREQ * 8 / RA8876_OSC_FREQ) - 1 }, 1);
+	/* set SDRAM clock */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MPLLC1, (uint8_t[]) { 0x04 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MPLLC2, (uint8_t[]) { (RA8876_DRAM_FREQ * 4 / RA8876_OSC_FREQ) - 1 }, 1);
 	/* set core clock */
-#if (RA8876_CORE_FREQ >= 125)
-	panel_ra8876_tx_param(panel, RA8876_REG_SPLLC1, RA8876_PLL_DIV_2);
-	panel_ra8876_tx_param(panel, RA8876_REG_SPLLC2, (RA8876_CORE_FREQ * 2 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_CORE_FREQ >= 63) && (RA8876_CORE_FREQ <= 124)
-	panel_ra8876_tx_param(panel, RA8876_REG_SPLLC1, RA8876_PLL_DIV_4);
-	panel_ra8876_tx_param(panel, RA8876_REG_SPLLC2, (RA8876_CORE_FREQ * 4 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_CORE_FREQ >= 31) && (RA8876_CORE_FREQ <= 62)
-	panel_ra8876_tx_param(panel, RA8876_REG_SPLLC1, RA8876_PLL_DIV_8);
-	panel_ra8876_tx_param(panel, RA8876_REG_SPLLC2, (RA8876_CORE_FREQ * 8 / RA8876_OSC_FREQ) - 1);
-#endif
-#if (RA8876_CORE_FREQ <= 30)
-	panel_ra8876_tx_param(panel, RA8876_REG_SPLLC1, RA8876_PLL_DIV_8);
-	panel_ra8876_tx_param(panel, RA8876_REG_SPLLC2, (30 * 8 / RA8876_OSC_FREQ) - 1);
-#endif
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_SPLLC1, (uint8_t[]) { 0x04 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_SPLLC2, (uint8_t[]) { (RA8876_CORE_FREQ * 4 / RA8876_OSC_FREQ) - 1 }, 1);
+	/* reconfigure PLL generator */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_CCR, (uint8_t[]) { 0x00 }, 1);
+	vTaskDelay(pdMS_TO_TICKS(1));
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_CCR, (uint8_t[]) { 0x80 }, 1);
+	vTaskDelay(pdMS_TO_TICKS(1));
 
-	/* reconfigure PLLs */
-	panel_ra8876_tx_param(panel, RA8876_REG_CCR, 0x00);
-	vTaskDelay(pdMS_TO_TICKS(10));
-	panel_ra8876_tx_param(panel, RA8876_REG_CCR, 0x80);		// 0x80 (bit 7) = Reconfigure PLL frequency
-	vTaskDelay(pdMS_TO_TICKS(10));
-
-	/* SDRAM (W9812G6JH) */
-	panel_ra8876_tx_param(panel, RA8876_REG_SDRAR, 0x29);	// 64Mb/8MB/4Mx16: 4 banks, 4096 rows, 512 cols
-	panel_ra8876_tx_param(panel, RA8876_REG_SDRMD, 0x03);	// CAS:2=0x02; ACAS:3=0x03
+	/* configure SDRAM */
 	uint16_t sdram_itv = ((64000000 / 8192) / (1000 / RA8876_DRAM_FREQ)) - 2;
-	panel_ra8876_tx_param(panel, RA8876_REG_SDR_REF_ITVL0, sdram_itv & 0xff);
-	panel_ra8876_tx_param(panel, RA8876_REG_SDR_REF_ITVL1, (sdram_itv >> 8) & 0xff);
-	panel_ra8876_tx_param(panel, RA8876_REG_SDRCR, 0x01);	// 0x01 (bit 0) = initialise SDRAM
-	vTaskDelay(pdMS_TO_TICKS(10));
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_SDRAR, (uint8_t[]) { 0x31 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_SDRMD, (uint8_t[]) { 0x03 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_SDR_REF_ITVL0, (uint8_t[]) { sdram_itv & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_SDR_REF_ITVL1, (uint8_t[]) { sdram_itv >> 8 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_SDRCR, (uint8_t[]) { 0x01 }, 1);
+	/* wait for SDRAM to become ready */
+	panel_ra8876_wait(panel);
+	vTaskDelay(pdMS_TO_TICKS(1));
 
-	/* set chip configuration register */
-	panel_ra8876_tx_param(panel, RA8876_REG_CCR, ra8876->chip_config_register);	// set tft panel 24bit, host bus 8/16bit
+	/* set chip config register */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_CCR, (uint8_t[]) { ra8876->chip_config_register }, 1);
 
-	/* set memory access control register */
-	val = 0;
-	val |= 0b01000000;	// bits 7-6 = image data format (16bit to 16bit)
-	/* bits 2-1 = host write memory direction (00 = L-R,T-B, 01 = R-L,T-B, 10 = T-B,L-R, 11 = B-T,L-R */
-	panel_ra8876_tx_param(panel, RA8876_REG_MACR, val);
+	/* configure memory address control register */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MACR, (uint8_t[]) { ra8876->macr }, 1);
 
-	/* set input control register */
-	val = 0;
-	// bit 7 = interrupt pin level, 0 = active low, 1 = active high
-	// bit 2 = text mode enable, 0 = graphic mode, 1 = text mode
-	// bits 1-0 = memory select, 00 = sdram, 01 = gamma table, 10 = graphic cursor ram, 11 = color palette ram
-	panel_ra8876_tx_param(panel, RA8876_REG_ICR, val);
+	/* set graphic mode */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_ICR, (uint8_t[]) { 0x00 }, 1);
 
 	/* set display configuration register */
-	ra8876->display_config_register |= 0b10000000;
-	// bit 7 = pclk inversion, 0 = rising edge, 1 = falling edge
-	panel_ra8876_tx_param(panel, RA8876_REG_DPCR, ra8876->display_config_register);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_DPCR, (uint8_t[]) { ra8876->display_config_register }, 1);
 
-	/* set panel scan clock and data setting register */
-	val = 0b00000011;
-	// bit 7 = hsync polarity, 0 = low active, 1 = high active
-	val |= 0b10000000;
-	// bit 6 = vsync polarity, 0 = low active, 1 = high active
-	val |= 0b01000000;
-	panel_ra8876_tx_param(panel, RA8876_REG_PCSR, val);
-	
-	/* set horizontal display width register
-	 * set horizontal non-display period register
-	 */
-	val = (ra8876->lcd_width / 8) - 1;
-	panel_ra8876_tx_param(panel, RA8876_REG_HDWR, val);
-	panel_ra8876_tx_param(panel, RA8876_REG_HNDR, val);
-	val = (ra8876->lcd_width % 8);
-	panel_ra8876_tx_param(panel, RA8876_REG_HDWFTR, val);
-	panel_ra8876_tx_param(panel, RA8876_REG_HNDFTR, val);
+	/* set HSYNC+VSYNC+DE high active */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_PCSR, (uint8_t[]) { 0xc0 }, 1);
 
-	/* set vertical display height register */
-	panel_ra8876_tx_param(panel, RA8876_REG_VDHR0, ((ra8876->lcd_height) - 1) & 0xff);
-	panel_ra8876_tx_param(panel, RA8876_REG_VDHR1, (((ra8876->lcd_height) - 1) >> 8) & 0xff);
+	/* set LCD width */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_HDWR, (uint8_t[]) { (ra8876->lcd_width / 8) - 1 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_HDWFTR, (uint8_t[]) { ra8876->lcd_width % 8 }, 1);
 
-	/* set hsync start position register */
-	panel_ra8876_tx_param(panel, RA8876_REG_HSTR, (ra8876->lcd_width / 8) - 1);
+	/* set LCD height */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_VDHR0, (uint8_t[]) { (ra8876->lcd_height - 1) & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_VDHR1, (uint8_t[]) { (ra8876->lcd_height - 1) >> 8 }, 1);
 
-	/* set hsync pulse width register */
-	panel_ra8876_tx_param(panel, RA8876_REG_HPWR, (ra8876->lcd_width / 8) - 1);
+	/* set horizontal non-display period / back porch */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_HNDR, (uint8_t[]) { (RA8876_PANEL_HNDR / 8) - 1 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_HNDFTR, (uint8_t[]) { RA8876_PANEL_HNDR % 8 }, 1);
 
-	/* set vertical non-display period register */
-	panel_ra8876_tx_param(panel, RA8876_REG_VNDR0, 22);
-	panel_ra8876_tx_param(panel, RA8876_REG_VNDR1, 0x00);
+	/* set horizontal start position / front porch */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_HSTR, (uint8_t[]) { (RA8876_PANEL_HSTR / 8) - 1 }, 1);
 
-	/* set vsync start position register */
-	panel_ra8876_tx_param(panel, RA8876_REG_VSTR, 11);
+	/* set HSYNC pulse width */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_HPWR, (uint8_t[]) { (RA8876_PANEL_HPWR / 8) - 1 }, 1);
 
-	/* set vsync pulse width register */
-	panel_ra8876_tx_param(panel, RA8876_REG_VPWR, 9);
+	/* set vertical non-display period */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_VNDR0, (uint8_t[]) { (RA8876_PANEL_VNDR - 1) & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_VNDR1, (uint8_t[]) { (RA8876_PANEL_VNDR - 1) >> 8 }, 1);
 
-	/* set main/pip window control register */
-	val = 0;
-	// bits 3-2 = main image colour depth, 00 = 8bpp, 01 = 16bpp, 1x = 24bpp
-	val |= 0b00000100;
-	panel_ra8876_tx_param(panel, RA8876_REG_MPWCTR, val);
+	/* set vertical start position */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_VSTR, (uint8_t[]) { (RA8876_PANEL_VSTR - 1) }, 1);
 
-	/* set main image start address */
-	panel_ra8876_tx_param(panel, RA8876_REG_MISA0, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_MISA1, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_MISA2, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_MISA3, 0x00);
+	/* set VSYNC pulse width */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_VPWR, (uint8_t[]) { (RA8876_PANEL_VPWR - 1) }, 1);
 
-	/* set main image width */
-	panel_ra8876_tx_param(panel, RA8876_REG_MIW0, ra8876->lcd_width & 0xff);
-	panel_ra8876_tx_param(panel, RA8876_REG_MIW1, (ra8876->lcd_width >> 8) & 0xff);
+	/* set panel to PIP disabled, 16bpp TFT (65k colours) */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MPWCTR, (uint8_t[]) { 0x04 }, 1);
 
-	/* set main window start X/Y */
-	panel_ra8876_tx_param(panel, RA8876_REG_MWULX0, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_MWULX1, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_MWULY0, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_MWULY1, 0x00);
+	/* set main image start address to start of sdram */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MISA0, (uint8_t[]) { 0x00 & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MISA1, (uint8_t[]) { 0x00 >> 8 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MISA2, (uint8_t[]) { 0x00 >> 16 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MISA3, (uint8_t[]) { 0x00 >> 24 }, 1);
 
-	/* set canvas start address */
-	panel_ra8876_tx_param(panel, RA8876_REG_CVSSA0, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_CVSSA1, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_CVSSA2, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_CVSSA3, 0x00);
+	/* set main image width to panel width */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MIW0, (uint8_t[]) { ra8876->lcd_width & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MIW1, (uint8_t[]) { ra8876->lcd_width >> 8 }, 1);
 
-	/* set canvas image width */
-	panel_ra8876_tx_param(panel, RA8876_REG_CVS_IMWTH0, ra8876->lcd_width & 0xff);
-	panel_ra8876_tx_param(panel, RA8876_REG_CVS_IMWTH1, (ra8876->lcd_width >> 8) & 0xff);
+	/* set main window start coordinates to 0x0 */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MWULX0, (uint8_t[]) { 0x00 & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MWULX1, (uint8_t[]) { 0x00 >> 8 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MWULY0, (uint8_t[]) { 0x00 & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MWULY1, (uint8_t[]) { 0x00 >> 8 }, 1);
 
-	/* set active window start X/Y */
-	panel_ra8876_tx_param(panel, RA8876_REG_AWUL_X0, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_AWUL_X1, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_AWUL_Y0, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_AWUL_Y1, 0x00);
+	/* set canvas image start address to start of sdram */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_CVSSA0, (uint8_t[]) { 0x00 & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_CVSSA1, (uint8_t[]) { 0x00 >> 8 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_CVSSA2, (uint8_t[]) { 0x00 >> 16 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_CVSSA3, (uint8_t[]) { 0x00 >> 24 }, 1);
 
-	/* set active window width and height */
-	panel_ra8876_tx_param(panel, RA8876_REG_AW_WTH0, ra8876->lcd_width & 0xff);
-	panel_ra8876_tx_param(panel, RA8876_REG_AW_WTH1, (ra8876->lcd_width >> 8) & 0xff);
-	panel_ra8876_tx_param(panel, RA8876_REG_AW_HT0, ra8876->lcd_height & 0xff);
-	panel_ra8876_tx_param(panel, RA8876_REG_AW_HT1, (ra8876->lcd_height >> 8) & 0xff);
+	/* set canvas image width to panel width */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_CVS_IMWTH0, (uint8_t[]) { ra8876->lcd_width & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_CVS_IMWTH1, (uint8_t[]) { ra8876->lcd_width >> 8 }, 1);
 
-	/* set color depth of canvas and active window */
-	val = 0;
-	// bit 2 = canvas addressing mode, 0 = block mode, 1 = linear mode
-	// bits 1-0 = color depth, 00 = 8bpp, 01 = 16bpp, 1x = 24bpp
-	val |= 0b00000001;
-	panel_ra8876_tx_param(panel, RA8876_REG_AW_COLOR, val);
+	/* set top left corner of active window to 0,0 */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_AWUL_X0, (uint8_t[]) { 0x00 & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_AWUL_X1, (uint8_t[]) { 0x00 >> 8 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_AWUL_Y0, (uint8_t[]) { 0x00 & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_AWUL_Y1, (uint8_t[]) { 0x00 >> 8 }, 1);
 
-	/* set main/pip window control register */
-	val = 0;
-	// bits 3-2 = main image colour depth, 00 = 8bpp, 01 = 16bpp, 1x = 24bpp
-	val |= 0b00000100;
-	panel_ra8876_tx_param(panel, RA8876_REG_MPWCTR, val);
+	/* width active window to full panel width and height */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_AW_WTH0, (uint8_t[]) { ra8876->lcd_width & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_AW_WTH1, (uint8_t[]) { ra8876->lcd_width >> 8 }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_AW_HT0, (uint8_t[]) { ra8876->lcd_height & 0xff }, 1);
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_AW_HT1, (uint8_t[]) { ra8876->lcd_height >> 8 }, 1);
 
-	/* turn display on */
-	ra8876->display_config_register |= 0b01000000;
-	panel_ra8876_tx_param(panel, RA8876_REG_DPCR, ra8876->display_config_register);
-	vTaskDelay(pdMS_TO_TICKS(20));
+	/* configure block mode, and 16bpp memory mode */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_AW_COLOR, (uint8_t[]) { 0x01 }, 1);
 
-	/* Enable_PWM0_Interrupt() */
-	val = 0x01;		// PWM Timer-0 Interrupt Enable
-	panel_ra8876_tx_param(panel, RA8876_REG_INTEN, val);
-	/* Clear_PWM0_Interrupt_Flag() */
-	val = 0x01;		// Clear PWM0 Interrupt Flag
-	panel_ra8876_tx_param(panel, RA8876_REG_INTF, val);
-	/* Mask_PWM0_Interrupt_Flag() */
-	val = 0x01;		// Mask PWM0 Timer Interrupt Flag
-	panel_ra8876_tx_param(panel, RA8876_REG_MINTFR, val);
-	/* Select_PWM0_Clock_Divided_By_2()
-	 * Select_PWM0()
-	 */
-	val = 0b00010010;	// Setup PWM Timer-0 Divisor (div 2), PWM0 output PWM Timer 0
-	panel_ra8876_tx_param(panel, RA8876_REG_PMUXR, val);
-	/* Enable_PWM0_Dead_Zone()
-	 * Auto_Reload_PWM0()
-	 * Start_PWM0()
-	 */
-	val = 0b00101011;	// PWM Timer-0 Dead Zone Enable (bit 3),
-						// PWM Timer-0 Auto Reload on (bit 1)
-						// PWM Timer-0 Start (bit 0)
-	panel_ra8876_tx_param(panel, RA8876_REG_PCFGR, val);
-	/* Set_Timer0_Compare_Buffer(0x0000) */
-	/* set BL level to off */
-	panel_ra8876_tx_param(panel, RA8876_REG_TCMPB0L, 0x00);
-	panel_ra8876_tx_param(panel, RA8876_REG_TCMPB0H, 0x00);
-	ra8876->backlight_level = 0x0000;
+	/* set panel to PIP disabled, 16bpp TFT (65k colours) */
+	esp_lcd_panel_io_tx_param(ra8876->io, RA8876_REG_MPWCTR, (uint8_t[]) { 0x04 }, 1);
 
 	return ESP_OK;
 }
 
 static void panel_ra8876_set_window(esp_lcd_panel_t *panel, int x_start, int y_start, int x_end, int y_end)
 {
-	ra8876_panel_t					*ra8876 = __containerof(panel, ra8876_panel_t, base);
-
-	if (ra8876->swap_axes)
-	{
-		int xs = x_start;
-		int xe = x_end;
-
-		x_start = y_start;
-		y_start = xs;
-
-		x_end = y_end;
-		y_end = xe;
-	}
-
 	/* set active window start X/Y */
 	panel_ra8876_tx_param(panel, RA8876_REG_AWUL_X0, x_start & 0xff);
 	panel_ra8876_tx_param(panel, RA8876_REG_AWUL_X1, (x_start >> 8) & 0xff);
@@ -518,16 +403,6 @@ static void panel_ra8876_set_window(esp_lcd_panel_t *panel, int x_start, int y_s
 
 static void panel_ra8876_set_cursor(esp_lcd_panel_t *panel, int x_start, int y_start, int x_end, int y_end)
 {
-	ra8876_panel_t					*ra8876 = __containerof(panel, ra8876_panel_t, base);
-
-	if (ra8876->swap_axes)
-	{
-		int xs = x_start;
-
-		x_start = y_start;
-		y_start = xs;
-	}
-
 	panel_ra8876_tx_param(panel, RA8876_REG_CURH0, x_start & 0xff);
 	panel_ra8876_tx_param(panel, RA8876_REG_CURH1, (x_start >> 8) & 0xff);
 	panel_ra8876_tx_param(panel, RA8876_REG_CURV0, y_start & 0xff);
@@ -552,7 +427,7 @@ static esp_err_t panel_ra8876_draw_bitmap(esp_lcd_panel_t *panel, int x_start, i
 	panel_ra8876_set_cursor(panel, x_start, y_start, x_end, y_end);
 
 	/* Write to graphic RAM */
-	size_t len = (x_end - x_start) * (y_end - y_start) * ra8876->bits_per_pixel / 8;
+	size_t len = (x_end - x_start) * (y_end - y_start) * 2;
 	esp_lcd_panel_io_tx_color(io, RA8876_REG_MRWDP, color_data, len);
 
 	return ESP_OK;
@@ -572,11 +447,8 @@ static esp_err_t panel_ra8876_mirror(esp_lcd_panel_t *panel, bool mirror_x, bool
 
 static esp_err_t panel_ra8876_swap_xy(esp_lcd_panel_t *panel, bool swap_axes)
 {
-	ra8876_panel_t					*ra8876 = __containerof(panel, ra8876_panel_t, base);
-
-	ra8876->swap_axes = swap_axes;
-
-	return ESP_OK;
+	ESP_LOGE(TAG, "swap_xy is unsupported");
+	return ESP_ERR_NOT_SUPPORTED;
 }
 
 static esp_err_t panel_ra8876_set_gap(esp_lcd_panel_t *panel, int x_gap, int y_gap)

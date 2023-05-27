@@ -28,3 +28,9 @@ For more information on the usage of the `idf_component.yml` file please refer t
 
 Due to the i80 nature of the interface, this requires ESP32-S3 or higher.
 Older ESP32 chips do not have hardware support for i80 interfaces.
+
+
+## Testing
+
+This has been tested against a BuyDisplay.com ER-TFTM070-6 panel in 16-bit i80 mode at 12MHz.
+(note: at slower clock speeds, screen corruption was observed)

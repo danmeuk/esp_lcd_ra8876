@@ -1,0 +1,70 @@
+# Kconfig file for esp_lcd_ra8876
+
+menu "LCD Driver for RA8876/LT768x"
+	choice
+		prompt "Pre-defined panel"
+		default RA8876_PANEL_ER_TFTM070_6
+		help
+			Pre-defined options for a panel
+		config RA8876_PANEL_ER_TFTM070_6
+			bool "BuyDisplay.com ER-TFTM070-6 (1024x600, i80)"
+		config RA8876_PANEL_CUSTOM
+			bool "Custom panel"
+	endchoice
+
+	config RA8876_PANEL
+		string
+		default "ER-TFTM070-6" if RA8876_PANEL_ER_TFTM070_6
+		default "CUSTOM" if RA8876_PANEL_CUSTOM
+
+	config RA8876_OSC_FREQ
+		int "OSC_FREQ: Oscillator clock (MHz)"
+		default 10
+		depends on RA8876_PANEL_CUSTOM
+
+	config RA8876_DRAM_FREQ
+		int "DRAM_FREQ: SDRAM clock (MHz)"
+		default 100
+		depends on RA8876_PANEL_CUSTOM
+
+	config RA8876_CORE_FREQ
+		int "CORE_FREQ: CORE clock (MHz)"
+		default 100
+		depends on RA8876_PANEL_CUSTOM
+
+	config RA8876_SCAN_FREQ
+		int "SCAN_FREQ: pixel clock (MHz)"
+		default 50
+		depends on RA8876_PANEL_CUSTOM
+
+	config RA8876_HNDR
+		int "HNDR: horizontal non-display period or back porch"
+		default 160
+		depends on RA8876_PANEL_CUSTOM
+
+	config RA8876_HSTR
+		int "HSTR: horizontal start position or front porch"
+		default 160
+		depends on RA8876_PANEL_CUSTOM
+
+	config RA8876_HPWR
+		int "HPWR: HSYNC pulse width"
+		default 70
+		depends on RA8876_PANEL_CUSTOM
+
+	config RA8876_VNDR
+		int "VNDR: vertical non-display period"
+		default 23
+		depends on RA8876_PANEL_CUSTOM
+
+	config RA8876_VSTR
+		int "VSTR: vertical start position"
+		default 12
+		depends on RA8876_PANEL_CUSTOM
+
+	config RA8876_VPWR
+		int "VPWR: VSYNC pulse width"
+		default 10
+		depends on RA8876_PANEL_CUSTOM
+
+endmenu
